@@ -1,0 +1,37 @@
+# Caches
+__pycache__/
+*.pyc
+.cache/
+.DS_Store
+
+# Outputs / data (regenerate, do not commit)
+results/
+logs/
+scripts/ablation/
+datasets/*
+!datasets/resources/
+datasets/resources/*
+!datasets/simulation_rs/
+datasets/simulation_rs/*
+!datasets/simulation_rs/ground_truth_pathways.csv
+!datasets/simulation_ds/
+datasets/simulation_ds/*
+!datasets/simulation_ds/ground_truth_pathways.csv
+figures/
+paper/
+analysis/
+*.npy
+*.npz
+*.h5ad
+*.pt
+
+!datasets/resources/pathway_prior.npz
+!datasets/simulation_rs/sim_pathway_prior.npz
+!datasets/simulation_ds/sim_pathway_prior.npz
+
+# Data files (33GB) not for Github
+rds_files/
+*.bak
+
+.vscode/
+.idea/
