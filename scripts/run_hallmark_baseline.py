@@ -88,7 +88,8 @@ def _bootstrap_ci(y, p, metric, n=N_BOOTSTRAP, seed=0):
     return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
 
 
-def run_cohort(cohort: str, fold_selection: bool = True) -> dict:
+def run_cohort(cohort: str, fold_selection: bool = True,
+               rebalance: bool = False) -> dict:
     print(f"\n{'=' * 70}\n  Hallmark pathway-score baseline: {cohort}\n{'=' * 70}")
 
     X, obs, _gn, ct_groups, ct_ids, pat_ids, pat_labels, prior = load_cohort_data(
@@ -107,7 +108,8 @@ def run_cohort(cohort: str, fold_selection: bool = True) -> dict:
     print(f"  {S.shape[0]:,} cells scored over {S.shape[1]} Hallmark pathways "
           f"({len(patients)} patients, {int(y_all.sum())} positive)")
 
-    out_dir = RESULTS_IRAEGIS / cohort / "hallmark_baseline"
+    out_dir = RESULTS_IRAEGIS / cohort / ("hallmark_baseline_rloocv" if rebalance
+                                      else "hallmark_baseline")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     oof = np.full(len(patients), np.nan)
@@ -125,7 +127,7 @@ def run_cohort(cohort: str, fold_selection: bool = True) -> dict:
         hi = patients.index(held)
         res = train_h_concat_gated_concat_en(
             S_f, pat_f, ct_f, pat_labels, groups_f, verbose=False,
-            only_patient_idx=hi)
+            only_patient_idx=hi, rebalance=rebalance)
         oof[hi] = res["oof_probs"][hi]
         rows.append({"patient": held, "label": int(y_all[hi]),
                      "oof_prob": float(oof[hi]), "n_ct": len(groups_f),
@@ -141,6 +143,8 @@ def run_cohort(cohort: str, fold_selection: bool = True) -> dict:
 
     summary = {
         "cohort": cohort,
+        "validation": "RLOOCV (rebalanced: one opposite-class training patient "
+                      "dropped per fold)" if rebalance else "LOOCV",
         "model": "fixed Hallmark pathway scores (mean log-normalised expression "
                  "of member genes); no autoencoder, no latent representation",
         "downstream": "identical to irAEGIS: top-25%-by-norm patient x CT "
@@ -169,11 +173,16 @@ def main():
     ap.add_argument("--no-fold-selection", action="store_true",
                     help="Use cohort-wide cell-type grouping instead of "
                          "deriving it per fold from training patients.")
+    ap.add_argument("--rebalance", action="store_true",
+                    help="Rebalanced LOOCV: drop one opposite-class training "
+                         "patient per fold so training class composition is "
+                         "constant across folds.")
     args = ap.parse_args()
 
     cohorts = [args.cohort] if args.cohort else (
         list(COHORTS_REAL) if args.all else ap.error("pass --cohort or --all"))
-    res = [run_cohort(c, not args.no_fold_selection) for c in cohorts]
+    res = [run_cohort(c, not args.no_fold_selection, args.rebalance)
+           for c in cohorts]
 
     if len(res) > 1:
         print(f"\n{'=' * 70}\n  SUMMARY — Hallmark pathway-score baseline\n{'=' * 70}")

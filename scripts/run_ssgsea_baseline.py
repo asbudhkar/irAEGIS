@@ -101,7 +101,7 @@ def _boot(y, p, metric, n=N_BOOTSTRAP, seed=0):
     return float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))
 
 
-def run_cohort(cohort: str) -> dict:
+def run_cohort(cohort: str, rebalance: bool = False) -> dict:
     print(f"\n{'='*70}\n  ssGSEA Hallmark baseline: {cohort}\n{'='*70}")
     gene_sets = load_gmt(GMT)
     print(f"  {len(gene_sets)} Hallmark gene sets from {GMT.name}")
@@ -115,7 +115,9 @@ def run_cohort(cohort: str) -> dict:
     y = np.array([pat_labels[p] for p in patients], dtype=np.int64)
     print(f"  {X.shape[0]:,} cells x {X.shape[1]:,} genes, {len(patients)} patients")
 
-    out = RESULTS_IRAEGIS / cohort / "ssgsea_baseline"; out.mkdir(parents=True, exist_ok=True)
+    out = RESULTS_IRAEGIS / cohort / ("ssgsea_baseline_rloocv" if rebalance
+                                  else "ssgsea_baseline")
+    out.mkdir(parents=True, exist_ok=True)
     oof, rows, t0 = np.full(len(patients), np.nan), [], time.time()
 
     for i, held in enumerate(patients):
@@ -133,7 +135,8 @@ def run_cohort(cohort: str) -> dict:
 
         hi = patients.index(held)
         res = train_h_concat_gated_concat_en(
-            h, h_pat, h_ct, pat_labels, groups_f, verbose=False, only_patient_idx=hi)
+            h, h_pat, h_ct, pat_labels, groups_f, verbose=False, only_patient_idx=hi,
+            rebalance=rebalance)
         oof[hi] = res["oof_probs"][hi]
         rows.append({"patient": held, "label": int(y[hi]), "oof_prob": float(oof[hi]),
                      "n_ct": len(groups_f), "n_profiles": len(keys),
@@ -145,6 +148,8 @@ def run_cohort(cohort: str) -> dict:
     auc, ap = float(roc_auc_score(y, oof)), float(average_precision_score(y, oof))
     alo, ahi = _boot(y, oof, roc_auc_score); plo, phi = _boot(y, oof, average_precision_score)
     summary = {"cohort": cohort,
+               "validation": "RLOOCV (rebalanced: one opposite-class training "
+                             "patient dropped per fold)" if rebalance else "LOOCV",
                "model": "ssGSEA Hallmark scores on patient x cell-type pseudobulk; "
                         "no autoencoder, no latent representation",
                "why_ssgsea_not_gsva": "ssGSEA ranks genes within each sample, so it is "
@@ -162,10 +167,14 @@ def main():
     ap_ = argparse.ArgumentParser(description=__doc__,
             formatter_class=argparse.RawDescriptionHelpFormatter)
     ap_.add_argument("--cohort"); ap_.add_argument("--all", action="store_true")
+    ap_.add_argument("--rebalance", action="store_true",
+                     help="Rebalanced LOOCV: drop one opposite-class training "
+                          "patient per fold so training class composition is "
+                          "constant across folds.")
     a = ap_.parse_args()
     cohorts = [a.cohort] if a.cohort else (list(COHORTS_REAL) if a.all
                else ap_.error("pass --cohort or --all"))
-    res = [run_cohort(c) for c in cohorts]
+    res = [run_cohort(c, a.rebalance) for c in cohorts]
     if len(res) > 1:
         print(f"\n{'='*70}\n  SUMMARY — ssGSEA Hallmark baseline\n{'='*70}")
         for s in res:
