@@ -664,12 +664,26 @@ def main():
                          "activations h. Tests whether the bottleneck adds "
                          "anything beyond the pathway layer, which is what "
                          "all downstream classifiers and attributions use.")
-    ap.add_argument("--fold-selection", action="store_true",
-                    help="Derive HVG gene selection AND cell-type grouping "
-                         "from training-fold cells only. Both are data-"
-                         "dependent and currently computed over all cells, "
-                         "including the held-out patient. Writes to a "
-                         "*_foldsel/ subdir.")
+    # Leakage-free selection is the DEFAULT. HVG ranking and cell-type
+    # grouping are both data-dependent, so computing them over all cells lets
+    # the held-out patient influence the gene set and the surviving cell types.
+    # Making that the opt-in behaviour meant a run launched without the flag
+    # silently produced leaky numbers that look identical to leakage-free ones;
+    # the failure is invisible in the output. It is now opt-OUT, and the opt-out
+    # exists only to reproduce pre-revision results.
+    ap.add_argument("--fold-selection", dest="fold_selection",
+                    action="store_true", default=True,
+                    help="(default, and kept for backward compatibility) Derive "
+                         "HVG gene selection AND cell-type grouping from "
+                         "training-fold cells only. Writes to a *_foldsel/ "
+                         "subdir.")
+    ap.add_argument("--no-fold-selection", dest="fold_selection",
+                    action="store_false",
+                    help="OPT OUT of leakage-free selection: compute the HVG "
+                         "set and cell-type grouping once over ALL cells, "
+                         "including the held-out patient. This LEAKS and is "
+                         "provided only to reproduce pre-revision results. "
+                         "Writes to the unsuffixed subdir.")
     ap.add_argument("--no-diagnostics", action="store_true",
                     help="Skip h-space OOD / recon-MSE / per-CT diagnostics. "
                          "These cost ~15 min/fold (cKDTree in 50-D) and do "
