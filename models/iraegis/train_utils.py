@@ -50,11 +50,19 @@ def train_ae(ae:         PathwayAE,
              verbose:    bool  = True,
              ct_ids:     "np.ndarray | None" = None,
              ct_aux_weight: "float | None" = None,
-             decorr_weight: "float | None" = None) -> list:
+             decorr_weight: "float | None" = None,
+             mask_frac: "float | None" = None) -> list:
     
     # Train autoencoder
+    # mask_frac=0.0 disables the denoising corruption entirely, turning this
+    # into a plain autoencoder (ablation for the denoising component).
+    mask_f   = AE_MASK_FRAC if mask_frac is None else float(mask_frac)
     ct_aux_w = AE_CT_AUX_WEIGHT if ct_aux_weight is None else float(ct_aux_weight)
     decorr_w = AE_DECORR_WEIGHT if decorr_weight is None else float(decorr_weight)
+    if getattr(ae, "decoder", None) is None and ct_aux_w == 0 and decorr_w == 0:
+        raise ValueError(
+            "train_ae: model has no decoder (no_latent) and both auxiliary "
+            "weights are zero — there is no training signal.")
     ae.to(DEVICE)
     rng = np.random.default_rng(_rs())
     n   = len(X)
@@ -93,11 +101,17 @@ def train_ae(ae:         PathwayAE,
             x_b   = X_gpu[b_idx]
             # Denoising: randomly zero out AE_MASK_FRAC of genes in the INPUT,
             # but reconstruct the full clean input.
-            keep_mask = (torch.rand_like(x_b) > AE_MASK_FRAC).float()
-            x_in      = x_b * keep_mask / max(1.0 - AE_MASK_FRAC, 1e-6)
+            if mask_f > 0:
+                keep_mask = (torch.rand_like(x_b) > mask_f).float()
+                x_in      = x_b * keep_mask / max(1.0 - mask_f, 1e-6)
+            else:
+                x_in      = x_b          # no denoising: plain autoencoder
             ct_b = ct_gpu[b_idx] if ct_ids is not None else None
             h_b, _, x_r = ae(x_in, ct_ids=ct_b)
-            loss  = F.mse_loss(x_r, x_b)
+            # x_r is None when the model has no decoder (no_latent ablation):
+            # h is then shaped only by the auxiliary objectives below.
+            loss = (F.mse_loss(x_r, x_b) if x_r is not None
+                    else torch.zeros((), device=DEVICE))
             if use_ct_aux and ct_aux_w > 0:
                 ct_logits = ae.ct_head(h_b)
                 loss = loss + ct_aux_w * F.cross_entropy(ct_logits, ct_gpu[b_idx])
@@ -122,8 +136,15 @@ def train_ae(ae:         PathwayAE,
             vi = rng.choice(val_idx, min(4096, len(val_idx)), replace=False)
             xv = X_gpu[vi]
             ct_v = ct_gpu[vi] if ct_ids is not None else None
-            _, _, xrv = ae(xv, ct_ids=ct_v)
-            vl = F.mse_loss(xrv, xv).item()
+            _, hv, xrv = ae(xv, ct_ids=ct_v)
+            # No decoder (no_latent): track the auxiliary CT loss instead, so
+            # best-checkpoint selection still has a validation signal.
+            if xrv is not None:
+                vl = F.mse_loss(xrv, xv).item()
+            elif use_ct_aux:
+                vl = F.cross_entropy(ae.ct_head(hv), ct_gpu[vi]).item()
+            else:
+                vl = float(ep_loss / max(nb, 1))
 
         if vl < best_val:
             best_val = vl
@@ -432,7 +453,8 @@ def train_h_concat_gated_concat_en(
         C_inner: float = 0.1,
         C_outer: float = 1.0,
         use_logit: bool = True,
-        verbose: bool = True) -> dict:
+        verbose: bool = True,
+        only_patient_idx: "int | None" = None) -> dict:
     
     # Patient-level irAEGIS classifier
     unique_pats = sorted(pat_labels.keys())
@@ -498,7 +520,14 @@ def train_h_concat_gated_concat_en(
     oof_probs = np.full(n_pats, np.nan, dtype=np.float64)
     fold_selected_cts = []
 
-    for P_idx in range(n_pats):
+    # Each outer iteration writes only oof_probs[P_idx] from tr_idx = all-but-P_idx,
+    # so restricting the loop to one index yields an identical value for that
+    # patient. Used by the per-fold AE ablation, which needs exactly one OOF prob
+    # per refit AE and would otherwise discard n_pats-1 of them.
+    outer_indices = (range(n_pats) if only_patient_idx is None
+                     else [int(only_patient_idx)])
+
+    for P_idx in outer_indices:
         tr_idx = np.array([i for i in range(n_pats) if i != P_idx])
         per_ct = inner_aucs(tr_idx)
         selected = [j for j, a in enumerate(per_ct) if a >= auc_gate]
@@ -545,7 +574,11 @@ def train_h_concat_gated_concat_en(
         oof_probs[P_idx] = outer.predict_proba(f[[P_idx]])[0, 1]
 
     valid = ~np.isnan(oof_probs)
-    mean_auc, mean_ap, bal_acc, mcc = _compute_metrics(pat_arr, oof_probs, valid)
+    if valid.sum() >= 3 and len(set(pat_arr[valid])) == 2:
+        mean_auc, mean_ap, bal_acc, mcc = _compute_metrics(pat_arr, oof_probs, valid)
+    else:
+        # single-patient mode (only_patient_idx): cohort metrics are undefined
+        mean_auc = mean_ap = bal_acc = mcc = float("nan")
     avg_selected = (sum(len(s) for s in fold_selected_cts)
                     / max(len(fold_selected_cts), 1))
 

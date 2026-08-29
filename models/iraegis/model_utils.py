@@ -74,11 +74,24 @@ class PathwayAE(nn.Module):
                  norm: str = "bn",         # "bn", "ln", or "ctbn"
                  act: str = "gelu",        # "gelu" or "relu"
                  n_ct: int = 0,            # required when norm="ctbn"
+                 no_latent: bool = False,  # ablation: pathway -> phenotype only
                  ):
+        """
+        no_latent: reduce the model to a pathway-to-phenotype encoder — keep the
+            Hallmark-masked projection up to the pathway activity layer h, and
+            drop both the latent bottleneck and the reconstruction path. There
+            is no decoder, so h is shaped only by the auxiliary cell-type and
+            pathway-decorrelation objectives. Ablation for whether the
+            reconstruction objective and bottleneck contribute anything, given
+            that h is what every downstream classifier and attribution uses.
+            Requires a non-zero auxiliary or decorrelation weight, since
+            otherwise no training signal remains.
+        """
         super().__init__()
         self.n_genes    = n_genes
         self.n_pathways = n_pathways
         self.latent_dim = latent_dim
+        self.no_latent  = no_latent
         self._act_name  = act
         self._norm_name = norm
 
@@ -97,21 +110,24 @@ class PathwayAE(nn.Module):
 
         self._act_fn = F.gelu if act == "gelu" else F.relu
 
-        # Encoder: latent projection  (P -> L)
+        # Encoder: latent projection  (P -> L); omitted under no_latent
         act_module = nn.GELU() if act == "gelu" else nn.ReLU()
-        self.pw_to_z = nn.Sequential(
-            nn.Linear(n_pathways, latent_dim),
-            nn.BatchNorm1d(latent_dim),
-            act_module,
-            nn.Dropout(dropout),
-        )
-
-        # Decoder:  (L -> G)
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, n_pathways * 4),
-            nn.GELU() if act == "gelu" else nn.ReLU(),
-            nn.Linear(n_pathways * 4, n_genes),
-        )
+        if no_latent:
+            self.pw_to_z = nn.Identity()      # z is h
+            self.decoder = None               # no reconstruction path
+        else:
+            self.pw_to_z = nn.Sequential(
+                nn.Linear(n_pathways, latent_dim),
+                nn.BatchNorm1d(latent_dim),
+                act_module,
+                nn.Dropout(dropout),
+            )
+            # Decoder:  (L -> G)
+            self.decoder = nn.Sequential(
+                nn.Linear(latent_dim, n_pathways * 4),
+                nn.GELU() if act == "gelu" else nn.ReLU(),
+                nn.Linear(n_pathways * 4, n_genes),
+            )
 
         # Auxiliary cell-type head on h
         self.ct_head = None
@@ -142,7 +158,10 @@ class PathwayAE(nn.Module):
         z = self.pw_to_z(h)
         return h, z
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor):
+        """(cells, G) reconstruction, or None under no_latent (no decoder)."""
+        if self.decoder is None:
+            return None
         return self.decoder(z)               # (cells, G)
 
     def attach_ct_head(self, n_ct: int):
