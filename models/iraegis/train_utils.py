@@ -457,7 +457,8 @@ def train_h_concat_gated_concat_en(
         only_patient_idx: "int | None" = None,
         rebalance: bool = False,
         rebalance_seed: int = 0,
-        holdout_idx: "list | None" = None) -> dict:
+        holdout_idx: "list | None" = None,
+        top_k: "int | None" = None) -> dict:
     
     # Patient-level irAEGIS classifier
     unique_pats = sorted(pat_labels.keys())
@@ -557,7 +558,14 @@ def train_h_concat_gated_concat_en(
                 tr_idx = tr_idx[tr_idx != _rng.choice(_cand)]
 
         per_ct = inner_aucs(tr_idx)
-        selected = [j for j, a in enumerate(per_ct) if a >= auc_gate]
+        if top_k is not None:
+            # Reviewer 1 (R1.2): keep only the k highest-ranked cell types
+            # instead of every cell type clearing the gate. The ranking is the
+            # inner-LOOCV AUC computed on TRAINING patients only, so the choice
+            # of which cell types survive never sees the held-out patient.
+            selected = [int(j) for j in np.argsort(per_ct)[::-1][:int(top_k)]]
+        else:
+            selected = [j for j, a in enumerate(per_ct) if a >= auc_gate]
         if not selected:
             selected = [int(np.argmax(per_ct))]
         fold_selected_cts.append([active_cts[j] for j in selected])
@@ -622,6 +630,8 @@ def train_h_concat_gated_concat_en(
         "active_cts": active_cts,
         "patient_order": unique_pats,
         "oof_probs": oof_probs.tolist(),
+        # cell types the gate admitted in each outer fold, in fold order
+        "fold_selected_cts": fold_selected_cts,
         "cv_summary": {
             "method": "gated CT stacking + top-25",
             "mean_auc": mean_auc, "std_auc": 0.0,
