@@ -137,8 +137,14 @@ def train_ae(ae:         PathwayAE,
             xv = X_gpu[vi]
             ct_v = ct_gpu[vi] if ct_ids is not None else None
             _, hv, xrv = ae(xv, ct_ids=ct_v)
-            # No decoder (no_latent): track the auxiliary CT loss instead, so
-            # best-checkpoint selection still has a validation signal.
+            # Best-checkpoint selection is by validation RECONSTRUCTION MSE
+            # only, even though training also optimises the cell-type auxiliary
+            # and decorrelation terms -- those do not influence which epoch is
+            # kept. Under no_latent there is no decoder and hence no
+            # reconstruction loss, so selection falls back to the validation
+            # cell-type loss. The no_latent arm therefore differs from the full
+            # model in its model-selection criterion as well as its
+            # architecture, and that confound is part of its measured dAUC.
             if xrv is not None:
                 vl = F.mse_loss(xrv, xv).item()
             elif use_ct_aux:

@@ -659,11 +659,20 @@ def main():
                          "contributes beyond a sparse projection of the same "
                          "shape.")
     ap.add_argument("--no-latent", action="store_true",
-                    help="Omit the intermediate latent representation: the "
-                         "decoder reconstructs directly from the pathway "
-                         "activations h. Tests whether the bottleneck adds "
-                         "anything beyond the pathway layer, which is what "
-                         "all downstream classifiers and attributions use.")
+                    help="Remove the latent bottleneck AND the reconstruction "
+                         "objective together: the latent projection becomes an "
+                         "identity and the decoder is dropped entirely, so no "
+                         "reconstruction loss exists and h is shaped only by "
+                         "the cell-type auxiliary and decorrelation terms. "
+                         "This is the simpler pathway-to-phenotype model of "
+                         "Reviewer 1.4. NOTE the resulting dAUC measures the "
+                         "bottleneck and the reconstruction objective JOINTLY "
+                         "and cannot attribute the effect to either one alone. "
+                         "Note also that with no reconstruction loss, "
+                         "best-checkpoint selection falls back to validation "
+                         "cell-type loss rather than reconstruction MSE, so "
+                         "the two arms differ in model-selection criterion as "
+                         "well as architecture.")
     # Leakage-free selection is the DEFAULT. HVG ranking and cell-type
     # grouping are both data-dependent, so computing them over all cells lets
     # the held-out patient influence the gene set and the surviving cell types.
