@@ -8,12 +8,22 @@ and simpler pathway-based predictive models". This is that comparison:
                -> cell-type gate + patient-level logistic regression
 
 ssGSEA rather than GSVA, deliberately. GSVA estimates gene-wise expression
-distributions *across* samples, so a held-out patient's expression would
-influence every other patient's scores — reintroducing exactly the transductive
-dependence the per-fold protocol removes. ssGSEA ranks genes *within* each
-sample independently, so it is leakage-free by construction, and a given
-pseudobulk profile scores identically regardless of which other samples are
-present.
+distributions *across* samples, so a held-out patient's expression shifts every
+other patient's scores in a gene-dependent way that does not cancel downstream.
+ssGSEA ranks genes *within* each sample, so the enrichment step is sample-local.
+
+The normalised scores are not, however, literally sample-independent: gseapy
+returns NES, and the Barbie-2009 convention divides by a dataset-wide range.
+Verified empirically on this implementation — adding samples rescales scores by
+a *single global constant* (0.8167 in the test), identical across every sample
+and every pathway to within 5e-8. Because the downstream standardises features
+per cell type within each fold, that constant cancels exactly: standardised
+features were identical to within 8e-7 whether a profile was scored alone or
+alongside others. The held-out patient therefore cannot influence the fitted
+model, even though the raw NES values are not invariant.
+
+To reproduce: score one pseudobulk profile alone, then again with others, and
+compare the 50 pathway scores before and after StandardScaler.
 
 Everything downstream is identical to irAEGIS — the same inner-LOOCV cell-type
 gate and the same stacked patient-level classifier — so any gap is attributable
