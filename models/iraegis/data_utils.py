@@ -24,7 +24,20 @@ def _rel(p):
 def load_cohort_data(cohort_id: str, h5ad_path=None, prior_path=None,
                      prior_genes_only: bool = False, verbose: bool = True,
                      split_ct_groups: list | None = None,
-                     gene_list_path: str | Path | None = None):
+                     gene_list_path: str | Path | None = None,
+                     defer_selection: bool = False):
+    """Load a cohort into (X, obs, gene_names, ct_groups, ct_ids, pat_ids,
+    pat_labels, prior).
+
+    defer_selection: when True, skip the two data-dependent selection steps —
+        the HVG backfill and cell-type grouping — and return the full shared
+        gene space with raw `final_celltype` labels. The caller is then
+        responsible for performing both selections using training-fold cells
+        only (see analysis/fold_selection.py). Required for leakage-free
+        per-fold cross-validation, where both the gene set and the surviving
+        cell types must be derived without the held-out patient.
+        In this mode ct_groups is [] and ct_ids is all -1.
+    """
     # Load data
     import scanpy as sc
     from utils.celltype_groups import infer_celltype_groups
@@ -92,32 +105,40 @@ def load_cohort_data(cohort_id: str, h5ad_path=None, prior_path=None,
     obs.insert(0, "cell_barcode", adata.obs_names)
     gene_names = list(adata.var_names)
 
-    # CT grouping
-    if verbose:
-        print("  Inferring cell-type groups ...")
-    ct_groups_dict, ct_label_map = infer_celltype_groups(
-        obs, min_patients=3, min_cells_per_patient=10, verbose=verbose,
-        split_groups=split_ct_groups)
-    ct_groups = list(ct_groups_dict.keys())
+    # CT grouping — skipped under defer_selection so the caller can derive it
+    # per fold from training patients only.
+    if defer_selection:
+        ct_groups = []
+        ct_ids = np.full(len(obs), -1, dtype=np.int64)
+        if verbose:
+            print("  defer_selection: skipping CT grouping "
+                  "(caller derives it per fold)")
+    else:
+        if verbose:
+            print("  Inferring cell-type groups ...")
+        ct_groups_dict, ct_label_map = infer_celltype_groups(
+            obs, min_patients=3, min_cells_per_patient=10, verbose=verbose,
+            split_groups=split_ct_groups)
+        ct_groups = list(ct_groups_dict.keys())
 
-    # Build CT integer IDs; exclude Unknown / Other
-    ct_to_id = {}
-    for gid, (gname, labels) in enumerate(ct_groups_dict.items()):
-        for lab in labels:
-            ct_to_id[lab] = gid
+        # Build CT integer IDs; exclude Unknown / Other
+        ct_to_id = {}
+        for gid, (gname, labels) in enumerate(ct_groups_dict.items()):
+            for lab in labels:
+                ct_to_id[lab] = gid
 
-    ct_ids_raw = np.array([ct_to_id.get(ct, -1)
-                            for ct in obs["final_celltype"]], dtype=np.int64)
-    keep_mask = ct_ids_raw >= 0
-    X        = X[keep_mask]
-    obs      = obs[keep_mask].reset_index(drop=True)
-    ct_ids   = ct_ids_raw[keep_mask]
+        ct_ids_raw = np.array([ct_to_id.get(ct, -1)
+                                for ct in obs["final_celltype"]], dtype=np.int64)
+        keep_mask = ct_ids_raw >= 0
+        X        = X[keep_mask]
+        obs      = obs[keep_mask].reset_index(drop=True)
+        ct_ids   = ct_ids_raw[keep_mask]
 
-    if verbose:
-        n_excl = (~keep_mask).sum()
-        if n_excl:
-            print(f"  Excluded {n_excl:,} Unknown/Other cells")
-        print(f"  CT groups ({len(ct_groups)}): {ct_groups}")
+        if verbose:
+            n_excl = (~keep_mask).sum()
+            if n_excl:
+                print(f"  Excluded {n_excl:,} Unknown/Other cells")
+            print(f"  CT groups ({len(ct_groups)}): {ct_groups}")
 
     pat_ids = obs["patient_id"].values
     pat_label_raw = obs.groupby("patient_id")["irAE_status"].first()
@@ -157,7 +178,9 @@ def load_cohort_data(cohort_id: str, h5ad_path=None, prior_path=None,
     X_shared    = X[:, shared_h5ad]
     mask_shared = mask_gp[shared_pri, :]
 
-    if prior_genes_only:
+    # HVG backfill — skipped under defer_selection so the caller can rank
+    # variance using training-fold cells only.
+    if prior_genes_only and not defer_selection:
         active = mask_shared.sum(axis=1) > 0
         n_pw_total = int(active.sum())
         n_before = len(shared)
@@ -173,6 +196,11 @@ def load_cohort_data(cohort_id: str, h5ad_path=None, prior_path=None,
         X_shared    = X_shared[:, keep]
         mask_shared = mask_shared[keep, :]
         shared      = [shared[i] for i in keep]
+    elif defer_selection and verbose:
+        active = mask_shared.sum(axis=1) > 0
+        print(f"  defer_selection: keeping all {len(shared):,} shared genes "
+              f"({int(active.sum()):,} pathway-active, "
+              f"{int((~active).sum()):,} backfill candidates)")
 
     prior = {
         "mask":          mask_shared,
