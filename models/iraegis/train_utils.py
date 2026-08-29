@@ -454,7 +454,10 @@ def train_h_concat_gated_concat_en(
         C_outer: float = 1.0,
         use_logit: bool = True,
         verbose: bool = True,
-        only_patient_idx: "int | None" = None) -> dict:
+        only_patient_idx: "int | None" = None,
+        rebalance: bool = False,
+        rebalance_seed: int = 0,
+        holdout_idx: "list | None" = None) -> dict:
     
     # Patient-level irAEGIS classifier
     unique_pats = sorted(pat_labels.keys())
@@ -524,11 +527,35 @@ def train_h_concat_gated_concat_en(
     # so restricting the loop to one index yields an identical value for that
     # patient. Used by the per-fold AE ablation, which needs exactly one OOF prob
     # per refit AE and would otherwise discard n_pats-1 of them.
-    outer_indices = (range(n_pats) if only_patient_idx is None
-                     else [int(only_patient_idx)])
+    # Each fold holds out a SET of patients: one for LOOCV/RLOOCV, two for
+    # leave-pair-out. Every held-out patient is scored by the same fold model,
+    # so a pair is compared under one training set rather than across two.
+    if holdout_idx is not None:
+        outer_sets = [sorted({int(i) for i in holdout_idx})]
+    elif only_patient_idx is not None:
+        outer_sets = [[int(only_patient_idx)]]
+    else:
+        outer_sets = [[i] for i in range(n_pats)]
 
-    for P_idx in outer_indices:
-        tr_idx = np.array([i for i in range(n_pats) if i != P_idx])
+    for _held in outer_sets:
+        P_idx = _held[0]
+        _held_set = set(_held)
+        tr_idx = np.array([i for i in range(n_pats) if i not in _held_set])
+
+        # Rebalanced LOOCV (Hoyt et al.): holding out a positive leaves the
+        # training set relatively negative-enriched and vice versa, and that
+        # per-fold label-composition shift biases pooled LOOCV AUC downward.
+        # Dropping one opposite-class training patient holds the training class
+        # ratio constant across folds. Applies to the supervised stages only;
+        # the autoencoder is label-blind, so the composition shift does not
+        # arise there.
+        if rebalance and holdout_idx is None:
+            _rng = np.random.default_rng(rebalance_seed + P_idx)
+            _opp = 1 - int(pat_arr[P_idx])
+            _cand = tr_idx[pat_arr[tr_idx] == _opp]
+            if len(_cand) > 2:                    # keep >=2 per class
+                tr_idx = tr_idx[tr_idx != _rng.choice(_cand)]
+
         per_ct = inner_aucs(tr_idx)
         selected = [j for j, a in enumerate(per_ct) if a >= auc_gate]
         if not selected:
@@ -546,9 +573,12 @@ def train_h_concat_gated_concat_en(
                                           class_weight="balanced", random_state=_rs(),
                                           C=C_inner)
                 lr.fit(sc.transform(X_tr_full), y_tr_full)
-                feats[P_idx, col] = lr.predict_proba(sc.transform(pat_h[[P_idx], j]))[0, 1]
+                for _hp in _held:
+                    feats[_hp, col] = lr.predict_proba(
+                        sc.transform(pat_h[[_hp], j]))[0, 1]
             except Exception:
-                feats[P_idx, col] = 0.5
+                for _hp in _held:
+                    feats[_hp, col] = 0.5
             # Stacked inner-LOOCV predictions for training patients
             for i in tr_idx:
                 tr_minus_i = np.array([m for m in tr_idx if m != i])
@@ -571,7 +601,8 @@ def train_h_concat_gated_concat_en(
         outer = LogisticRegression(C=C_outer, max_iter=2000,
                                      class_weight="balanced", random_state=_rs())
         outer.fit(f[tr_idx], pat_arr[tr_idx])
-        oof_probs[P_idx] = outer.predict_proba(f[[P_idx]])[0, 1]
+        for _hp in _held:
+            oof_probs[_hp] = outer.predict_proba(f[[_hp]])[0, 1]
 
     valid = ~np.isnan(oof_probs)
     if valid.sum() >= 3 and len(set(pat_arr[valid])) == 2:
@@ -599,6 +630,7 @@ def train_h_concat_gated_concat_en(
             "n_patients": n_pats, "n_active_cts": K,
             "auc_gate": auc_gate, "avg_selected_cts": avg_selected,
             "C_inner": C_inner, "C_outer": C_outer,
+            "rebalanced_loocv": bool(rebalance),
         },
     }
 
