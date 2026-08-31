@@ -61,7 +61,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from utils.config import RESULTS_IRAEGIS, RANDOM_STATE
 from models.iraegis.data_utils import load_cohort_data
-from models.iraegis.fold_selection import select_ct_groups
+from models.iraegis.fold_selection import select_ct_groups, select_hvg_genes
 
 SPLIT_CT_GROUPS = ["T_cells", "Monocytes", "Dendritic"]
 SHARED_GENES = REPO / "datasets" / "processed_h5ad" / "shared_genes.txt"
@@ -70,6 +70,7 @@ N_PCA = 2                    # pseudobulk_en used PCA(2)
 GATE_TOPK = 5
 N_BOOT = 1000
 _CHUNK = 2000
+GENE_SPACE = "hvg2000"          # set from --gene-space
 SHORT = {"cell_lr": "lr", "cell_mlp": "mlp", "rf_pseudobulk": "rf",
          "xgboost_pseudobulk": "xgb", "pseudobulk_en": "en",
          "pseudobulk_en_gated": "en_gated"}
@@ -173,7 +174,12 @@ def run(cohort):
 
     for i, held in enumerate(patients):
         train_cells = pat != held
-        genes = hvg_by_variance(X, train_cells)          # TRAINING cells only
+        if GENE_SPACE == "matched":
+            # exactly irAEGIS's rule: every pathway-active gene plus the top
+            # HVG_BACKFILL non-pathway genes ranked on training cells only
+            genes = select_hvg_genes(X, prior["mask"], train_cells)
+        else:
+            genes = hvg_by_variance(X, train_cells)      # TRAINING cells only
         Xf = X[:, genes]
         groups, ct_all, keep = select_ct_groups(obs, train_cells, SPLIT_CT_GROUPS)
         hi = patients.index(held)
@@ -214,7 +220,7 @@ def run(cohort):
 
         recs.append({"patient": held, "label": int(y[hi]), "n_genes": len(genes),
                      "n_ct": len(groups), **{m: float(oof[m][hi]) for m in METHODS}})
-        out = RESULTS_IRAEGIS / cohort / "baselines_leakage_free"
+        out = RESULTS_IRAEGIS / cohort / f"baselines_leakage_free_{GENE_SPACE}"
         out.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(recs).to_csv(out / "per_fold.csv", index=False)
         print(f"  [{i+1}/{len(patients)}] {held}: " +
@@ -222,7 +228,8 @@ def run(cohort):
               f"  ({(time.time()-t0)/60:.1f} min)", flush=True)
         del Xf, per_ct
 
-    summary = {"cohort": cohort, "hvg_k": HVG_K, "n_pca": N_PCA,
+    summary = {"cohort": cohort, "gene_space": GENE_SPACE,
+               "hvg_k": HVG_K, "n_pca": N_PCA,
                "protocol": "leakage-free per-fold: HVG selected on training cells "
                            "only; cell-type grouping, scaling, PCA and classifiers "
                            "fit on training patients only",
@@ -237,16 +244,23 @@ def run(cohort):
         summary["methods"][m] = {"auc": a, "auc_ci95": [lo, hi_], "auprc": q}
         print(f"  {m:<22} {a:>8.4f} {f'[{lo:.3f}, {hi_:.3f}]':>18} {q:>8.4f}", flush=True)
     summary["total_seconds"] = time.time() - t0
-    (RESULTS_IRAEGIS / cohort / "baselines_leakage_free" / "summary.json").write_text(
+    (RESULTS_IRAEGIS / cohort / f"baselines_leakage_free_{GENE_SPACE}" / "summary.json").write_text(
         json.dumps(summary, indent=2))
-    print(f"  -> {RESULTS_IRAEGIS / cohort / 'baselines_leakage_free'}", flush=True)
+    print(f"  -> {RESULTS_IRAEGIS / cohort / f'baselines_leakage_free_{GENE_SPACE}'}", flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cohort", required=True)
+    ap.add_argument("--gene-space", choices=["hvg2000", "matched"], default="hvg2000",
+                    help="hvg2000 = each baseline's published rule (top-2000 by "
+                         "variance). matched = irAEGIS's exact feature space "
+                         "(all pathway-active genes + top-2000 non-pathway HVG), "
+                         "which is what R3.6's 'identical feature-selection rules' "
+                         "requires. Both are worth reporting.")
     a = ap.parse_args()
+    global GENE_SPACE; GENE_SPACE = a.gene_space
     run(a.cohort)
 
 

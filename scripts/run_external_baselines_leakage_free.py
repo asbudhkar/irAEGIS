@@ -79,6 +79,25 @@ def _boot(y, p, metric, n=N_BOOT, seed=0):
     return float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))
 
 
+def pathway_mask_for(gene_names):
+    """Binary (genes x pathways) Hallmark membership aligned to `gene_names`.
+
+    Needed for the `matched` gene space, which reproduces irAEGIS's rule of
+    keeping every pathway-active gene plus the top non-pathway HVGs.
+    """
+    from utils.config import PRIOR_NPZ
+    raw = np.load(PRIOR_NPZ, allow_pickle=True)
+    pg = list(raw["gene_names"]); m = raw["mask"]
+    m = m if m.shape[0] == len(pg) else m.T
+    idx = {g: i for i, g in enumerate(pg)}
+    out = np.zeros((len(gene_names), m.shape[1]), dtype=m.dtype)
+    for i, g in enumerate(gene_names):
+        j = idx.get(g)
+        if j is not None:
+            out[i] = m[j]
+    return out
+
+
 def load_deferred(cohort):
     """Load with gene selection DEFERRED (n_genes=None), then apply the same
     cell-type grouping and filtering the published wrappers use."""
@@ -89,12 +108,13 @@ def load_deferred(cohort):
         min_patients=3, min_cells_per_patient=10, split_groups=SPLIT)
     ct = np.array([ct_map.get(c, EXCLUDE_LABEL) for c in ct_raw])
     keep = (ct != EXCLUDE_LABEL) & (ct != "Other")
-    return X[keep], pat_ids[keep], ct[keep], patients, labels
+    return X[keep], pat_ids[keep], ct[keep], genes, patients, labels
 
 
-def run(cohort, method):
+def run(cohort, method, gene_space="hvg2000"):
     print(f"\n{'='*70}\n  Leakage-free {method}: {cohort}\n{'='*70}", flush=True)
-    X, pat_ids, ct, patients, labels = load_deferred(cohort)
+    X, pat_ids, ct, gene_names, patients, labels = load_deferred(cohort)
+    pmask = pathway_mask_for(gene_names) if gene_space == "matched" else None
     sorted_pats, sorted_labs, folds = get_cv_folds(patients, labels)
     y = np.array(sorted_labs, dtype=np.int8)
     pat_to_lab = dict(zip(sorted_pats, sorted_labs))
@@ -108,7 +128,11 @@ def run(cohort, method):
         pt = [sorted_pats[i] for i in tr_idx]
         pe = [sorted_pats[i] for i in va_idx]
         tr_cells = np.isin(pat_ids, pt)
-        genes = hvg_train_only(X, tr_cells)         # TRAINING cells only
+        if gene_space == "matched":
+            from models.iraegis.fold_selection import select_hvg_genes
+            genes = select_hvg_genes(X, pmask, tr_cells)   # irAEGIS's exact rule
+        else:
+            genes = hvg_train_only(X, tr_cells)            # TRAINING cells only
         Xf = X[:, genes]
         try:
             if method == "scrat":
@@ -153,7 +177,7 @@ def run(cohort, method):
         del Xf
 
     m = ~np.isnan(oof)
-    out = REPO / "results" / "iraegis" / cohort / "external_baselines_leakage_free" / method
+    out = REPO / "results" / "iraegis" / cohort / f"external_baselines_leakage_free_{gene_space}" / method
     out.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"patient": sorted_pats, "label": y, "oof_prob": oof}).to_csv(
         out / "per_fold.csv", index=False)
@@ -163,7 +187,7 @@ def run(cohort, method):
         ap = float(average_precision_score(y[m], oof[m]))
         (out / "summary.json").write_text(json.dumps(
             {"cohort": cohort, "method": method, "n_scored": int(m.sum()),
-             "hvg_per_fold": N_GENES, "auc": auc, "auc_ci95": [lo, hi], "auprc": ap,
+             "gene_space": gene_space, "hvg_per_fold": N_GENES, "auc": auc, "auc_ci95": [lo, hi], "auprc": ap,
              "protocol": "gene selection from training cells only; method itself "
                          "unmodified", "total_seconds": time.time() - t0}, indent=2))
         print(f"\n  AUC = {auc:.4f}  95% CI [{lo:.3f}, {hi:.3f}]   AUPRC = {ap:.4f} "
@@ -178,8 +202,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cohort", required=True)
     ap.add_argument("--method", required=True, choices=["scrat", "singledeep", "hiermil"])
+    ap.add_argument("--gene-space", choices=["hvg2000", "matched"], default="hvg2000",
+                    help="hvg2000 = the method's published rule. matched = "
+                         "irAEGIS's exact feature space (all pathway-active genes "
+                         "+ top-2000 non-pathway HVG), which is what R3.6's "
+                         "'identical feature-selection rules' requires.")
     a = ap.parse_args()
-    run(a.cohort, a.method)
+    run(a.cohort, a.method, a.gene_space)
 
 
 if __name__ == "__main__":
