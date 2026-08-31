@@ -35,9 +35,10 @@ The three external codebases (ScRAT, singleDeep, hierarchical MIL) have their ow
 preprocessing pipelines and are not covered here; see docs/revision_parked_items.md.
 
 Model settings are taken from the original tuning scripts so the only thing that
-changes is WHEN gene selection happens. cell_mlp uses scikit-learn's MLPClassifier
-in place of the original small torch network - a documented approximation, since
-an exact port would change more than the protocol.
+changes is WHEN gene selection happens. cell_mlp uses the ORIGINAL SimpleMLP from
+models/baselines/cell_mlp.py (Linear-LayerNorm-GELU x2, HIDDEN=32, LR=1e-3,
+WD=1e-2, 15 epochs, batch 2048) rather than a scikit-learn stand-in, so no method
+is altered by this harness.
 
 Outputs to results/iraegis/<cohort>/baselines_leakage_free/
 
@@ -55,7 +56,6 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import LeaveOneOut
-from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, average_precision_score
 
@@ -65,6 +65,26 @@ from utils.config import RESULTS_IRAEGIS, RANDOM_STATE
 from models.iraegis.data_utils import load_cohort_data
 from utils import profiler
 from models.iraegis.fold_selection import select_ct_groups, select_hvg_genes
+# Faithful copy of scPIP's models/baselines/cell_mlp.py SimpleMLP and its tuned
+# hyperparameters. Copied rather than imported: irAEGIS has its own `models` and
+# `utils` packages which shadow scPIP's, so importing that module here resolves
+# the wrong `utils.config`. Architecture and settings are byte-for-byte the
+# published ones (HIDDEN=32, LR=1e-3, WD=1e-2, 15 epochs, batch 2048), so the
+# method is unchanged - only the gene set differs.
+MLP_HIDDEN, MLP_LR, MLP_WD, MLP_EPOCHS, MLP_BATCH = 32, 1e-3, 1e-2, 15, 2048
+
+
+def _build_simple_mlp(n_in, hidden=MLP_HIDDEN):
+    import torch.nn as nn
+    return nn.Sequential(
+        nn.Linear(n_in, hidden),
+        nn.LayerNorm(hidden),
+        nn.GELU(),
+        nn.Linear(hidden, hidden // 2),
+        nn.LayerNorm(hidden // 2),
+        nn.GELU(),
+        nn.Linear(hidden // 2, 1),
+    )
 
 SPLIT_CT_GROUPS = ["T_cells", "Monocytes", "Dendritic"]
 SHARED_GENES = REPO / "datasets" / "processed_h5ad" / "shared_genes.txt"
@@ -111,14 +131,41 @@ def _models():
     return {
         "cell_lr": lambda: LogisticRegression(max_iter=2000, class_weight="balanced",
                                               random_state=R),
-        "cell_mlp": lambda: MLPClassifier(hidden_layer_sizes=(64, 32), alpha=1e-2,
-                                          max_iter=2000, random_state=R),
+
         "rf_pseudobulk": lambda: RandomForestClassifier(n_estimators=500, max_depth=3,
                                                         min_samples_leaf=3,
                                                         class_weight="balanced",
                                                         random_state=R, n_jobs=1),
         "xgboost_pseudobulk": None,      # constructed lazily, see below
     }
+
+
+def _mlp_fit_score(Xtr, ytr, Xte):
+    """Original SimpleMLP trained on patient pseudobulk, published settings."""
+    import torch, torch.nn.functional as F
+    dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    sc = StandardScaler().fit(Xtr)
+    xt = torch.tensor(sc.transform(Xtr), dtype=torch.float32, device=dev)
+    xe = torch.tensor(sc.transform(Xte), dtype=torch.float32, device=dev)
+    yt = torch.tensor(ytr, dtype=torch.float32, device=dev)
+    pw = torch.tensor([(ytr == 0).sum() / max((ytr == 1).sum(), 1)],
+                      dtype=torch.float32, device=dev)
+    torch.manual_seed(RANDOM_STATE)
+    clf = _build_simple_mlp(xt.shape[1]).to(dev)
+    opt = torch.optim.Adam(clf.parameters(), lr=MLP_LR, weight_decay=MLP_WD)
+    rng = np.random.default_rng(RANDOM_STATE)
+    for _ in range(MLP_EPOCHS):
+        clf.train()
+        perm = rng.permutation(len(xt))
+        for i in range(0, len(xt), MLP_BATCH):
+            b = perm[i:i + MLP_BATCH]
+            loss = F.binary_cross_entropy_with_logits(
+                clf(xt[b]).squeeze(-1), yt[b], pos_weight=pw)
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(clf.parameters(), 1.0); opt.step()
+    clf.eval()
+    with torch.no_grad():
+        return float(torch.sigmoid(clf(xe).squeeze(-1)).cpu().numpy()[0])
 
 
 def _xgb():
@@ -168,7 +215,7 @@ def run(cohort):
         split_ct_groups=SPLIT_CT_GROUPS, defer_selection=True, verbose=False)
     patients = sorted(lab.keys()); y = np.array([lab[p] for p in patients], dtype=np.int64)
     print(f"  {X.shape[0]:,} cells x {X.shape[1]:,} genes, {len(patients)} patients "
-          f"({y.sum()} positive); HVG={HVG_K} chosen per fold", flush=True)
+          f"({y.sum()} positive); gene space={GENE_SPACE}", flush=True)
 
     METHODS = ["cell_lr", "cell_mlp", "rf_pseudobulk", "xgboost_pseudobulk",
                "pseudobulk_en", "pseudobulk_en_gated"]
@@ -192,10 +239,13 @@ def run(cohort):
 
         pb = pseudobulk(Xf, pat, patients)
         mk = _models()
-        for m in ["cell_lr", "cell_mlp", "rf_pseudobulk"]:
+        for m in ["cell_lr", "rf_pseudobulk"]:
             _t = time.time()
             oof[m][hi] = _fit_score(mk[m](), pb[tr], y[tr], pb[[hi]])
             elapsed[m] += time.time() - _t
+        _t = time.time()
+        oof["cell_mlp"][hi] = _mlp_fit_score(pb[tr], y[tr], pb[[hi]])
+        elapsed["cell_mlp"] += time.time() - _t
         _t = time.time()
         oof["xgboost_pseudobulk"][hi] = _fit_score(_xgb(), pb[tr], y[tr], pb[[hi]])
         elapsed["xgboost_pseudobulk"] += time.time() - _t

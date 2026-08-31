@@ -52,6 +52,7 @@ REPO = Path(__file__).resolve().parents[1]
 from utils.config import RANDOM_STATE, get_cv_folds
 from utils import profiler
 from utils.data_helpers import load_cells_cohort
+from models.iraegis.fold_selection import select_hvg_genes
 from utils.celltype_groups import infer_celltype_groups, EXCLUDE_LABEL
 
 N_GENES = 2000
@@ -102,21 +103,36 @@ def pathway_mask_for(gene_names):
 
 
 def load_deferred(cohort):
-    """Load with gene selection DEFERRED (n_genes=None), then apply the same
-    cell-type grouping and filtering the published wrappers use."""
+    """Load with BOTH data-dependent selections deferred.
+
+    Gene selection is skipped (n_genes=None) and cell-type labels come back
+    ungrouped. Grouping is data-dependent too - its viability thresholds
+    (>=3 patients, >=10 cells per patient) are evaluated over whichever patients
+    are present - so it is recomputed per fold rather than once here.
+    """
     X, pat_ids, ct_raw, genes, patients, labels = load_cells_cohort(
         cohort, None, None, None)
+    return X, pat_ids, np.asarray(ct_raw), genes, patients, labels
+
+
+def group_celltypes(ct_raw, pat_ids, train_mask):
+    """Cell-type grouping decided from TRAINING cells only, applied to all cells.
+
+    Mirrors irAEGIS's select_ct_groups: which cell types survive never depends on
+    the held-out patient, and the resulting map is then applied everywhere so the
+    held-out patient is labelled by a scheme it did not influence.
+    """
     _, ct_map = infer_celltype_groups(
-        pd.DataFrame({"final_celltype": ct_raw, "patient_harmony": pat_ids}),
+        pd.DataFrame({"final_celltype": ct_raw[train_mask],
+                      "patient_harmony": pat_ids[train_mask]}),
         min_patients=3, min_cells_per_patient=10, split_groups=SPLIT)
     ct = np.array([ct_map.get(c, EXCLUDE_LABEL) for c in ct_raw])
-    keep = (ct != EXCLUDE_LABEL) & (ct != "Other")
-    return X[keep], pat_ids[keep], ct[keep], genes, patients, labels
+    return ct, (ct != EXCLUDE_LABEL) & (ct != "Other")
 
 
 def run(cohort, method, gene_space="matched"):
     print(f"\n{'='*70}\n  Leakage-free {method}: {cohort}\n{'='*70}", flush=True)
-    X, pat_ids, ct, gene_names, patients, labels = load_deferred(cohort)
+    X, pat_ids, ct_raw, gene_names, patients, labels = load_deferred(cohort)
     pmask = pathway_mask_for(gene_names) if gene_space == "matched" else None
     sorted_pats, sorted_labs, folds = get_cv_folds(patients, labels)
     y = np.array(sorted_labs, dtype=np.int8)
@@ -133,40 +149,44 @@ def run(cohort, method, gene_space="matched"):
     for fold_i, (tr_idx, va_idx) in enumerate(folds):
         pt = [sorted_pats[i] for i in tr_idx]
         pe = [sorted_pats[i] for i in va_idx]
-        tr_cells = np.isin(pat_ids, pt)
+        # Both data-dependent selections happen here, from training cells only.
+        # Cell-type grouping runs first because it decides which cells survive.
+        tr_all = np.isin(pat_ids, pt)
+        ct_f, keep = group_celltypes(ct_raw, pat_ids, tr_all)
+        Xk, patk, ctk = X[keep], pat_ids[keep], ct_f[keep]
+        tr_cells = np.isin(patk, pt)
         if gene_space == "matched":
-            from models.iraegis.fold_selection import select_hvg_genes
-            genes = select_hvg_genes(X, pmask, tr_cells)   # irAEGIS's exact rule
+            genes = select_hvg_genes(Xk, pmask, tr_cells)  # irAEGIS's own selector
         else:
-            genes = hvg_train_only(X, tr_cells)            # TRAINING cells only
-        Xf = X[:, genes]
+            genes = hvg_train_only(Xk, tr_cells)
+        Xf = Xk[:, genes]
         try:
             if method == "scrat":
                 import models.baselines.scrat as scrat
                 probs = scrat.train_fold(
-                    X=Xf, pat_ids=pat_ids, labels=labels,
+                    X=Xf, pat_ids=patk, labels=labels,
                     patients_tr=pt, patients_te=pe,
                     patients_all=sorted_pats, labels_all=y,
-                    n_genes=len(genes), celltypes=ct, seed=fold_i)
+                    n_genes=len(genes), celltypes=ctk, seed=fold_i)
             elif method == "singledeep":
                 import models.baselines.singledeep as sd
-                te = np.isin(pat_ids, pe)
-                cell_lab = np.array([pat_to_lab[p] for p in pat_ids], dtype=np.int8)
+                te = np.isin(patk, pe)
+                cell_lab = np.array([pat_to_lab[p] for p in patk], dtype=np.int8)
                 probs = sd.train_fold(
                     X_tr=Xf[tr_cells], y_tr_cell=cell_lab[tr_cells],
-                    ct_tr=ct[tr_cells], pat_tr=pat_ids[tr_cells],
-                    X_te=Xf[te], ct_te=ct[te], pat_te=pat_ids[te],
-                    patients_te=pe, ct_names=sorted(set(ct.tolist())),
+                    ct_tr=ctk[tr_cells], pat_tr=patk[tr_cells],
+                    X_te=Xf[te], ct_te=ctk[te], pat_te=patk[te],
+                    patients_te=pe, ct_names=sorted(set(ctk.tolist())),
                     pat_labels_tr=np.array([pat_to_lab[p] for p in pt], dtype=np.int8))
             elif method == "hiermil":
                 import models.baselines.hierarchical_mil as hmil
-                all_ct = sorted(set(ct.tolist()))
+                all_ct = sorted(set(ctk.tolist()))
                 def bags_for(ps):                     # rebuilt on this fold's genes
                     b = {}
                     for p in ps:
-                        idx = np.where(pat_ids == p)[0]
-                        b[p] = {c: Xf[idx[ct[idx] == c]] for c in all_ct
-                                if (ct[idx] == c).any()}
+                        idx = np.where(patk == p)[0]
+                        b[p] = {c: Xf[idx[ctk[idx] == c]] for c in all_ct
+                                if (ctk[idx] == c).any()}
                     return b
                 probs = hmil.train_fold(
                     bags_for(pt), np.array([pat_to_lab[p] for p in pt], dtype=np.int8),
