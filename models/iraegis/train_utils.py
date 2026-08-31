@@ -464,7 +464,13 @@ def train_h_concat_gated_concat_en(
         rebalance: bool = False,
         rebalance_seed: int = 0,
         holdout_idx: "list | None" = None,
-        top_k: "int | None" = None) -> dict:
+        top_k: "int | None" = None,
+        top_frac: float = 0.25,
+        agg_mode: str = "top_norm",
+        stability_selection: bool = False,
+        n_resamples: int = 20,
+        stability_threshold: float = 0.70,
+        subsample_frac: float = 0.80) -> dict:
     
     # Patient-level irAEGIS classifier
     unique_pats = sorted(pat_labels.keys())
@@ -485,9 +491,48 @@ def train_h_concat_gated_concat_en(
             if not mask.any():
                 continue
             cells = h[mask]
-            if cells.shape[0] >= 4:
+            # How a (patient, cell type) is summarised. "top_norm" with
+            # top_frac=0.25 is the published rule. The alternatives separate
+            # what that rule actually does: "random" keeps the same NUMBER of
+            # cells but chooses them at random, isolating sub-sampling from
+            # norm-ranking; "median" and "trimmed" keep every cell but resist
+            # the high-magnitude tail that norm-ranking selects for.
+            if cells.shape[0] < 4 or agg_mode == "mean":
+                pat_h_full[i, j] = cells.mean(axis=0)
+            elif agg_mode == "median":
+                pat_h_full[i, j] = np.median(cells, axis=0)
+            elif agg_mode == "trimmed":
+                lo_q, hi_q = np.percentile(np.linalg.norm(cells, axis=1), [10, 90])
+                nm = np.linalg.norm(cells, axis=1)
+                keep = cells[(nm >= lo_q) & (nm <= hi_q)]
+                pat_h_full[i, j] = (keep.mean(axis=0) if len(keep)
+                                    else cells.mean(axis=0))
+            elif agg_mode == "random":
+                k = max(1, int(round(top_frac * cells.shape[0])))
+                rng_a = np.random.default_rng(abs(hash((str(p), int(j)))) % (2**32))
+                sel = rng_a.choice(cells.shape[0], k, replace=False)
+                pat_h_full[i, j] = cells[sel].mean(axis=0)
+            elif agg_mode in ("top_z", "top_centroid"):
+                # Scale-free rankings. The raw L2 norm is dominated by overall
+                # magnitude, which tracks sequencing depth, so top_norm tends to
+                # select each patient's deepest cells rather than its most
+                # informative ones. Both alternatives rank on deviation within
+                # the (patient, cell type) group, which removes the component
+                # depth contributes uniformly across pathways. Selected cells
+                # are still averaged in the ORIGINAL pathway space, so pathway
+                # interpretability is unchanged - only the choice of cells moves.
+                mu = cells.mean(axis=0)
+                if agg_mode == "top_z":
+                    sd = cells.std(axis=0) + 1e-8
+                    score = np.linalg.norm((cells - mu) / sd, axis=1)
+                else:
+                    score = np.linalg.norm(cells - mu, axis=1)
+                cutoff = np.percentile(score, 100.0 * (1.0 - top_frac))
+                top = cells[score >= cutoff]
+                pat_h_full[i, j] = top.mean(axis=0) if len(top) else cells.mean(axis=0)
+            elif top_frac < 1.0:
                 norms = np.linalg.norm(cells, axis=1)
-                cutoff = np.percentile(norms, 75)
+                cutoff = np.percentile(norms, 100.0 * (1.0 - top_frac))
                 top = cells[norms >= cutoff]
                 pat_h_full[i, j] = top.mean(axis=0) if len(top) else cells.mean(axis=0)
             else:
@@ -564,7 +609,34 @@ def train_h_concat_gated_concat_en(
                 tr_idx = tr_idx[tr_idx != _rng.choice(_cand)]
 
         per_ct = inner_aucs(tr_idx)
-        if top_k is not None:
+
+        # Stability selection (Meinshausen & Buhlmann). A single inner-LOOCV AUC
+        # per cell type is a noisy statistic at these sample sizes, and a hard
+        # threshold on it flips membership between folds when several cell types
+        # score similarly. Instead, subsample the TRAINING patients repeatedly,
+        # re-run the gate on each subsample, and keep only cell types selected in
+        # at least `stability_threshold` of them. The held-out patient is absent
+        # from every subsample, so this remains leakage-free; it replaces "which
+        # cell types clear the bar once" with "which clear it reproducibly".
+        sel_freq = None
+        if stability_selection:
+            _srng = np.random.default_rng(_rs() + int(P_idx))
+            counts = np.zeros(len(per_ct))
+            n_sub = max(6, int(round(subsample_frac * len(tr_idx))))
+            done = 0
+            for _b in range(n_resamples):
+                sub = _srng.choice(tr_idx, n_sub, replace=False)
+                if (pat_arr[sub] == 1).sum() < 2 or (pat_arr[sub] == 0).sum() < 2:
+                    continue
+                counts += (inner_aucs(sub) >= auc_gate)
+                done += 1
+            if done:
+                sel_freq = counts / done
+
+        if stability_selection and sel_freq is not None:
+            selected = [j for j in range(len(per_ct))
+                        if sel_freq[j] >= stability_threshold]
+        elif top_k is not None:
             # Reviewer 1 (R1.2): keep only the k highest-ranked cell types
             # instead of every cell type clearing the gate. The ranking is the
             # inner-LOOCV AUC computed on TRAINING patients only, so the choice
@@ -647,6 +719,9 @@ def train_h_concat_gated_concat_en(
             "auc_gate": auc_gate, "avg_selected_cts": avg_selected,
             "C_inner": C_inner, "C_outer": C_outer,
             "rebalanced_loocv": bool(rebalance),
+            "stability_selection": bool(stability_selection),
+            "stability_threshold": stability_threshold if stability_selection else None,
+            "n_resamples": n_resamples if stability_selection else None,
         },
     }
 
