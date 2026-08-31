@@ -50,6 +50,7 @@ sys.path.insert(0, str(SCPIP))
 REPO = Path(__file__).resolve().parents[1]
 
 from utils.config import RANDOM_STATE, get_cv_folds
+from utils import profiler
 from utils.data_helpers import load_cells_cohort
 from utils.celltype_groups import infer_celltype_groups, EXCLUDE_LABEL
 
@@ -124,6 +125,9 @@ def run(cohort, method, gene_space="matched"):
           f"{len(sorted_pats)} patients; HVG={N_GENES} chosen per fold", flush=True)
 
     oof = np.full(len(sorted_pats), np.nan, dtype=np.float32)
+    # same profiler the published baseline runs used, so wall time and peak
+    # memory land in results/runtime_summary.csv alongside the existing rows
+    profiler.start(f"{method}_leakage_free_{gene_space}", cohort)
     t0 = time.time()
 
     for fold_i, (tr_idx, va_idx) in enumerate(folds):
@@ -178,6 +182,7 @@ def run(cohort, method, gene_space="matched"):
                   flush=True)
         del Xf
 
+    profiler.stop()
     m = ~np.isnan(oof)
     out = REPO / "results" / "iraegis" / cohort / f"external_baselines_leakage_free_{gene_space}" / method
     out.mkdir(parents=True, exist_ok=True)
@@ -205,10 +210,10 @@ def main():
     ap.add_argument("--cohort", required=True)
     ap.add_argument("--method", required=True, choices=["scrat", "singledeep", "hiermil"])
     ap.add_argument("--gene-space", choices=["matched", "hvg2000"], default="matched",
-                    help="hvg2000 = the method's published rule. matched = "
-                         "irAEGIS's exact feature space (all pathway-active genes "
-                         "+ top-2000 non-pathway HVG), which is what R3.6's "
-                         "'identical feature-selection rules' requires.")
+                    help="matched (default) = the published rule these methods "
+                         "already used via select_prior_genes - pathway-active "
+                         "genes + top-2000 non-pathway HVG - ranked on training "
+                         "cells only. hvg2000 = no pathway prior, a stricter variant.")
     a = ap.parse_args()
     run(a.cohort, a.method, a.gene_space)
 
