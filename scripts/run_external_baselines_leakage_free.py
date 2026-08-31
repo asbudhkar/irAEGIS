@@ -15,7 +15,9 @@ variance over TRAINING cells only inside each fold and hand the method its own
 gene subset.
 
     for each held-out patient:
-        rank genes by variance over TRAINING cells -> top N
+        select genes from TRAINING cells only, by default using irAEGIS's exact
+        rule (pathway-active genes + top 2000 non-pathway HVGs), so feature
+        selection is identical across all methods as R3.6 requires
         rebuild that method's inputs on the fold's gene set
         call the method's own train_fold() unchanged
         score the held-out patient
@@ -111,7 +113,7 @@ def load_deferred(cohort):
     return X[keep], pat_ids[keep], ct[keep], genes, patients, labels
 
 
-def run(cohort, method, gene_space="hvg2000"):
+def run(cohort, method, gene_space="matched"):
     print(f"\n{'='*70}\n  Leakage-free {method}: {cohort}\n{'='*70}", flush=True)
     X, pat_ids, ct, gene_names, patients, labels = load_deferred(cohort)
     pmask = pathway_mask_for(gene_names) if gene_space == "matched" else None
@@ -202,7 +204,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cohort", required=True)
     ap.add_argument("--method", required=True, choices=["scrat", "singledeep", "hiermil"])
-    ap.add_argument("--gene-space", choices=["hvg2000", "matched"], default="hvg2000",
+    ap.add_argument("--gene-space", choices=["matched", "hvg2000"], default="matched",
                     help="hvg2000 = the method's published rule. matched = "
                          "irAEGIS's exact feature space (all pathway-active genes "
                          "+ top-2000 non-pathway HVG), which is what R3.6's "

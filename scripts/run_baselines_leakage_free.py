@@ -13,7 +13,9 @@ scaling was already fold-correct. This harness moves HVG selection inside the
 fold, so the held-out patient contributes to nothing:
 
     for each held-out patient:
-        rank genes by variance over TRAINING cells only  -> top K
+        select genes from TRAINING cells only, by default using irAEGIS's exact
+        rule (every pathway-active gene plus the top 2000 non-pathway HVGs),
+        so feature selection is identical across all methods as R3.6 requires
         aggregate to patient level on that gene set
         fit the classifier on TRAINING patients only
         score the held-out patient
@@ -70,7 +72,7 @@ N_PCA = 2                    # pseudobulk_en used PCA(2)
 GATE_TOPK = 5
 N_BOOT = 1000
 _CHUNK = 2000
-GENE_SPACE = "hvg2000"          # set from --gene-space
+GENE_SPACE = "matched"          # set from --gene-space; default matches irAEGIS
 SHORT = {"cell_lr": "lr", "cell_mlp": "mlp", "rf_pseudobulk": "rf",
          "xgboost_pseudobulk": "xgb", "pseudobulk_en": "en",
          "pseudobulk_en_gated": "en_gated"}
@@ -253,7 +255,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cohort", required=True)
-    ap.add_argument("--gene-space", choices=["hvg2000", "matched"], default="hvg2000",
+    ap.add_argument("--gene-space", choices=["matched", "hvg2000"], default="matched",
                     help="hvg2000 = each baseline's published rule (top-2000 by "
                          "variance). matched = irAEGIS's exact feature space "
                          "(all pathway-active genes + top-2000 non-pathway HVG), "
