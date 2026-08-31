@@ -108,6 +108,20 @@ def _score_fold(h, ct_f, pat_f, groups_f, held, i, patients, y, pat_labels,
         h, pat_f, ct_f, pat_labels, groups_f, verbose=False, only_patient_idx=hi)
     oof["gate_stack"][hi] = res["oof_probs"][hi]
 
+    if "gate_stack_meanagg" in variants:
+        # NB: do not name these `rows` - that shadows the caller's result list.
+        pb_h, pb_pat, pb_ct = [], [], []
+        for p_ in np.unique(pat_f):
+            for j in range(len(groups_f)):
+                m = (pat_f == p_) & (ct_f == j)
+                if m.any():
+                    pb_h.append(h[m].mean(axis=0)); pb_pat.append(p_); pb_ct.append(j)
+        r2 = train_h_concat_gated_concat_en(
+            np.asarray(pb_h, dtype=np.float32), np.asarray(pb_pat),
+            np.asarray(pb_ct, dtype=np.int64), pat_labels, groups_f,
+            verbose=False, only_patient_idx=hi)
+        oof["gate_stack_meanagg"][hi] = r2["oof_probs"][hi]
+
     pat_h = _patient_ct_matrix(h, pat_f, ct_f, patients, len(groups_f))
     oof["concat_lr"][hi] = _plain_lr(pat_h.reshape(len(patients), -1), y, tr, hi)
     oof["mean_lr"][hi] = _plain_lr(pat_h.mean(axis=1), y, tr, hi)
@@ -120,7 +134,8 @@ def _score_fold(h, ct_f, pat_f, groups_f, held, i, patients, y, pat_labels,
 
 
 def run_cohort(cohort: str, src_dir: str,
-               representation: str = "learned") -> dict:
+               representation: str = "learned",
+               out_name: "str | None" = None) -> dict:
     print(f"\n{'='*70}\n  Downstream audit [{representation}]: {cohort}\n{'='*70}")
     ck_dir = RESULTS_IRAEGIS / cohort / src_dir / "checkpoints"
     if representation == "learned" and not ck_dir.exists():
@@ -149,11 +164,15 @@ def run_cohort(cohort: str, src_dir: str,
               f"scores over {X.shape[1]:,} genes -> {S_fixed.shape[1]} pathways")
 
     out_dir = (RESULTS_IRAEGIS / cohort /
-               ("downstream_audit" if representation == "learned"
-                else "downstream_audit_hallmark"))
+               (out_name or ("downstream_audit" if representation == "learned"
+                             else "downstream_audit_hallmark")))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    variants = ["gate_stack", "concat_lr", "mean_lr"]
+    # gate_stack_meanagg differs from gate_stack ONLY in the within-cell-type
+    # aggregation: cells are averaged rather than reduced to their top 25% by
+    # norm. Passing one row per (patient, cell type) makes the downstream's
+    # top-25% step a no-op, so the combiner is byte-for-byte the same.
+    variants = ["gate_stack", "gate_stack_meanagg", "concat_lr", "mean_lr"]
     oof = {v: np.full(len(patients), np.nan) for v in variants}
     rows, t0 = [], time.time()
 
@@ -179,10 +198,16 @@ def run_cohort(cohort: str, src_dir: str,
         groups_f = fs["ct_groups"]
         mask_f = torch.tensor(prior["mask"][genes, :], dtype=torch.float32)
 
+        # The no_latent ablation saves a checkpoint with no decoder and an
+        # Identity pw_to_z, so the architecture must be inferred from the file
+        # rather than assumed - otherwise load_state_dict fails on missing keys.
+        _sd = torch.load(ck, map_location="cpu")
+        _no_latent = "decoder.0.weight" not in _sd
         ae = PathwayAE(X_f.shape[1], n_pw, mask_f, AE_LATENT_DIM, AE_DROPOUT,
-                       norm="ctbn", act="gelu", n_ct=len(groups_f))
+                       norm="ctbn", act="gelu", n_ct=len(groups_f),
+                       no_latent=_no_latent)
         ae.attach_ct_head(len(groups_f))      # checkpoint carries the aux head
-        ae.load_state_dict(torch.load(ck, map_location="cpu"))
+        ae.load_state_dict(_sd)
         ae.to(DEVICE)
         ae.eval()
 
@@ -225,12 +250,16 @@ def main():
     ap.add_argument("--cohort", required=True)
     ap.add_argument("--src-dir", default="ae_per_fold_deterministic_foldsel",
                     help="results subdir holding the per-fold checkpoints")
+    ap.add_argument("--out-name", default=None,
+                    help="results subdir to write to; defaults to downstream_audit. "
+                         "Use when auditing an ablation's checkpoints so runs do "
+                         "not overwrite each other.")
     ap.add_argument("--representation", choices=["learned", "hallmark"],
                     default="learned",
                     help="learned = per-fold autoencoder h; hallmark = fixed "
                          "Hallmark pathway scores (no learning, no checkpoint)")
     a = ap.parse_args()
-    run_cohort(a.cohort, a.src_dir, a.representation)
+    run_cohort(a.cohort, a.src_dir, a.representation, a.out_name)
 
 
 if __name__ == "__main__":

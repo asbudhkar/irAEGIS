@@ -88,8 +88,27 @@ def _bootstrap_ci(y, p, metric, n=N_BOOTSTRAP, seed=0):
     return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
 
 
+def _pseudobulk_mean(S, pat, ct, n_ct):
+    """Collapse cells to one MEAN row per (patient, cell type).
+
+    Passing one row per patient x cell type makes the downstream's
+    top-25%-by-norm step a no-op (it needs >=4 cells to trigger), so the
+    effective aggregation becomes a plain mean. This isolates the aggregation
+    rule while leaving every other stage of the pipeline untouched.
+    """
+    rows, prs, cts = [], [], []
+    for p_ in np.unique(pat):
+        for j in range(n_ct):
+            m = (pat == p_) & (ct == j)
+            if not m.any():
+                continue
+            rows.append(S[m].mean(axis=0)); prs.append(p_); cts.append(j)
+    return (np.asarray(rows, dtype=np.float32),
+            np.asarray(prs), np.asarray(cts, dtype=np.int64))
+
+
 def run_cohort(cohort: str, fold_selection: bool = True,
-               rebalance: bool = False) -> dict:
+               rebalance: bool = False, aggregation: str = "top25") -> dict:
     print(f"\n{'=' * 70}\n  Hallmark pathway-score baseline: {cohort}\n{'=' * 70}")
 
     X, obs, _gn, ct_groups, ct_ids, pat_ids, pat_labels, prior = load_cohort_data(
@@ -108,8 +127,9 @@ def run_cohort(cohort: str, fold_selection: bool = True,
     print(f"  {S.shape[0]:,} cells scored over {S.shape[1]} Hallmark pathways "
           f"({len(patients)} patients, {int(y_all.sum())} positive)")
 
-    out_dir = RESULTS_IRAEGIS / cohort / ("hallmark_baseline_rloocv" if rebalance
-                                      else "hallmark_baseline")
+    _sfx = (("_rloocv" if rebalance else "")
+            + ("_meanagg" if aggregation == "mean" else ""))
+    out_dir = RESULTS_IRAEGIS / cohort / f"hallmark_baseline{_sfx}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     oof = np.full(len(patients), np.nan)
@@ -123,6 +143,9 @@ def run_cohort(cohort: str, fold_selection: bool = True,
             S_f, ct_f, pat_f = S[keep], ct_f_all[keep], pat_ids[keep]
         else:
             groups_f, S_f, ct_f, pat_f = ct_groups, S, ct_ids, pat_ids
+
+        if aggregation == "mean":
+            S_f, pat_f, ct_f = _pseudobulk_mean(S_f, pat_f, ct_f, len(groups_f))
 
         hi = patients.index(held)
         res = train_h_concat_gated_concat_en(
@@ -151,6 +174,8 @@ def run_cohort(cohort: str, fold_selection: bool = True,
                       "aggregation, inner-LOOCV cell-type gate, stacked "
                       "patient-level logistic regression",
         "fold_wise_ct_grouping": fold_selection,
+        "aggregation": ("plain mean over cells" if aggregation == "mean"
+                        else "top 25% by norm"),
         "n_patients": len(patients), "n_positive": int(y_all.sum()),
         "n_pathways": int(S.shape[1]),
         "auc": auc, "auc_ci95": [a_lo, a_hi],
@@ -173,6 +198,10 @@ def main():
     ap.add_argument("--no-fold-selection", action="store_true",
                     help="Use cohort-wide cell-type grouping instead of "
                          "deriving it per fold from training patients.")
+    ap.add_argument("--aggregation", choices=["top25", "mean"], default="top25",
+                    help="Patient x cell-type aggregation. 'top25' (default) is "
+                         "the model's top-25%%-by-norm rule; 'mean' averages all "
+                         "cells instead, isolating the effect of that rule.")
     ap.add_argument("--rebalance", action="store_true",
                     help="Rebalanced LOOCV: drop one opposite-class training "
                          "patient per fold so training class composition is "
@@ -181,8 +210,8 @@ def main():
 
     cohorts = [args.cohort] if args.cohort else (
         list(COHORTS_REAL) if args.all else ap.error("pass --cohort or --all"))
-    res = [run_cohort(c, not args.no_fold_selection, args.rebalance)
-           for c in cohorts]
+    res = [run_cohort(c, not args.no_fold_selection, args.rebalance,
+                      args.aggregation) for c in cohorts]
 
     if len(res) > 1:
         print(f"\n{'=' * 70}\n  SUMMARY — Hallmark pathway-score baseline\n{'=' * 70}")
